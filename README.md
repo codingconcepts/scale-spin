@@ -45,10 +45,10 @@ docker buildx build \
 --platform linux/amd64 \
 --build-context pkg=apps/pkg \
 -f apps/workload/Dockerfile \
--t codingconcepts/workload:v0.17.2 \
+-t codingconcepts/workload:v0.1.0 \
 .
 
-docker push codingconcepts/workload:v0.17.2
+docker push codingconcepts/workload:v0.1.0
 ```
 
 Infra
@@ -104,6 +104,14 @@ gcloud beta run services logs read crdb-scale-spin --region europe-west2 --limit
 gcloud beta run services logs read crdb-scale-spin --region us-east1 --limit 10
 ```
 
+Fetch Apdex scores
+
+```sh
+curl -s "${AP_SERVICE_URL}/apdex"
+curl -s "${EU_SERVICE_URL}/apdex"
+curl -s "${US_SERVICE_URL}/apdex"
+```
+
 Spin the wheel!
 
 ```sh
@@ -148,10 +156,10 @@ docker buildx build \
 --platform linux/amd64 \
 --build-context pkg=apps/pkg \
 -f apps/workload/Dockerfile \
--t codingconcepts/workload:v0.17.2 \
+-t codingconcepts/workload:v0.1.0 \
 .
 
-docker push codingconcepts/workload:v0.17.2
+docker push codingconcepts/workload:v0.1.0
 ```
 
 Update infrastructure to publish multi-region application.
@@ -182,6 +190,13 @@ Infra
 
 ```sh
 (cd infra && terraform destroy --auto-approve)
+```
+
+Local images
+
+```sh
+docker rmi $(docker images codingconcepts/workload -q) -f
+docker rmi $(docker images us-east1-docker.pkg.dev/cockroach-rob/scale-spin-workload/codingconcepts/workload -q) -f
 ```
 
 ### Scratchpad

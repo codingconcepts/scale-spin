@@ -32,7 +32,8 @@ func main() {
 	var r repo.Repo
 	switch strings.ToLower(e.DatabaseDriver) {
 	case "pgx":
-		r = repo.NewPostgresRepoMR(db, e.Region)
+		r = repo.NewPostgresRepo(db)
+		// r = repo.NewPostgresRepoMR(db, e.Region)
 	}
 
 	runner := runner.New(r, e.Region)
