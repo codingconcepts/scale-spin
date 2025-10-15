@@ -12,24 +12,29 @@ import (
 )
 
 type Worker struct {
-	repo         repo.Repo
-	requestsMade chan time.Duration
-	ctx          context.Context
-	cancel       context.CancelFunc
+	repo   repo.Repo
+	taken  chan time.Duration
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
-func NewWorker(ctx context.Context, cancel context.CancelFunc, repo repo.Repo) *Worker {
+func NewWorker(ctx context.Context, cancel context.CancelFunc, repo repo.Repo, taken chan time.Duration) *Worker {
 	return &Worker{
 		repo:   repo,
+		taken:  taken,
 		ctx:    ctx,
 		cancel: cancel,
 	}
 }
 
 func (w *Worker) run() error {
-	ids, err := w.repo.FetchIDs()
+	ids, err := w.fetchIDs()
 	if err != nil {
 		return fmt.Errorf("fetching ids: %w", err)
+	}
+
+	if len(ids) == 0 {
+		return fmt.Errorf("no ids found")
 	}
 
 	requestTicks := time.Tick(time.Second / 100)
@@ -50,12 +55,19 @@ func (w *Worker) run() error {
 				log.Printf("error making request: %v", err)
 			}
 
-			w.requestsMade <- taken
+			w.taken <- taken
 
 		case <-w.ctx.Done():
 			return nil
 		}
 	}
+}
+
+func (w *Worker) fetchIDs() ([]any, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
+	defer cancel()
+
+	return w.repo.FetchIDs(ctx)
 }
 
 func (w *Worker) makeRequest(idFrom, idTo any, amount float64) (taken time.Duration, err error) {
@@ -64,6 +76,9 @@ func (w *Worker) makeRequest(idFrom, idTo any, amount float64) (taken time.Durat
 		taken = time.Since(start)
 	}()
 
-	err = w.repo.MakeRequest(idFrom, idTo, amount)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*1)
+	defer cancel()
+
+	err = w.repo.MakeRequest(ctx, idFrom, idTo, amount)
 	return
 }

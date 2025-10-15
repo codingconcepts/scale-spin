@@ -33,3 +33,7 @@ const (
 	// Tests that messages are reaching service.
 	ScenarioTest Scenario = "test"
 )
+
+type ScenarioRequest struct {
+	Scenario string `json:"scenario"`
+}

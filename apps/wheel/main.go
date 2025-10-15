@@ -1,22 +1,24 @@
 package main
 
 import (
-	"context"
+	"database/sql"
+	"flag"
 	"fmt"
 	"image/color"
 	"log"
 	"math"
 	"math/rand"
-	"time"
+	"net/http"
+	"os"
 
-	"github.com/codingconcepts/env"
 	"github.com/codingconcepts/scale-spin/apps/pkg/models"
-	"github.com/codingconcepts/scale-spin/apps/pkg/queue"
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/text"
 	"golang.org/x/image/font/basicfont"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 const (
@@ -26,12 +28,12 @@ const (
 
 var (
 	scenarios = []models.Scenario{
+		models.ScenarioScaleUpAP,
+		models.ScenarioScaleDownAP,
 		models.ScenarioScaleUpEU,
 		models.ScenarioScaleDownEU,
 		models.ScenarioScaleUpUS,
 		models.ScenarioScaleDownUS,
-		models.ScenarioScaleUpAP,
-		models.ScenarioScaleDownAP,
 		models.ScenarioFlashSale,
 		models.ScenarioNewProduct,
 		models.ScenarioScandal,
@@ -39,47 +41,33 @@ var (
 	}
 )
 
-type environment struct {
-	USSQSQueueURL string `env:"US_SQS_QUEUE_URL" required:"true"`
-	EUSQSQueueURL string `env:"EU_SQS_QUEUE_URL" required:"true"`
-	APSQSQueueURL string `env:"AP_SQS_QUEUE_URL" required:"true"`
-}
-
 func main() {
-	var e environment
-	if err := env.Set(&e); err != nil {
-		log.Fatalf("error setting environment: %v", err)
+	dbURL := flag.String("url", "", "url to the database")
+	flag.Parse()
+
+	if *dbURL == "" {
+		flag.Usage()
+		os.Exit(2)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	publishers, err := initializePublishers(ctx, e)
+	db, err := sql.Open("pgx", *dbURL)
 	if err != nil {
-		log.Fatalf("initializing publishers: %v", err)
+		log.Fatalf("error opening database connection: %v", err)
 	}
 
 	ebiten.SetWindowSize(screenW, screenH)
 	ebiten.SetWindowTitle("Scale Spin")
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 
-	game := NewGame(publishers)
+	game := NewGame(db)
 	if err := ebiten.RunGame(game); err != nil {
 		log.Fatalf("running game: %v", err)
 	}
 }
 
-func initializePublishers(ctx context.Context, e environment) (*queue.SQSPublishers, error) {
-	queues := []string{
-		e.EUSQSQueueURL,
-		e.USSQSQueueURL,
-		e.APSQSQueueURL,
-	}
-	return queue.NewSQSPublishers(ctx, queues)
-}
-
 type Game struct {
-	publishers       *queue.SQSPublishers
+	db               *sql.DB
+	regionServices   map[string]*http.Client
 	segments         []models.Scenario
 	colors           []color.RGBA
 	angle            float64
@@ -92,18 +80,18 @@ type Game struct {
 	white1x1 *ebiten.Image
 }
 
-func NewGame(publishers *queue.SQSPublishers) *Game {
+func NewGame(db *sql.DB) *Game {
 	white := ebiten.NewImage(1, 1)
 	white.Fill(color.White)
 
 	return &Game{
-		publishers: publishers,
-		segments:   scenarios,
-		colors:     palette(len(scenarios)),
-		centerX:    screenW / 2,
-		centerY:    screenH / 2,
-		radius:     260,
-		white1x1:   white,
+		db:       db,
+		segments: scenarios,
+		colors:   palette(len(scenarios)),
+		centerX:  screenW / 2,
+		centerY:  screenH / 2,
+		radius:   260,
+		white1x1: white,
 	}
 }
 
@@ -139,24 +127,53 @@ func (g *Game) Draw(screen *ebiten.Image) {
 
 	ebitenutil.DebugPrintAt(screen, string(g.lastResult), 10, screenH-20)
 
-	if err := g.publishMessage(g.lastResult); err != nil {
+	if err := g.applyScenario(g.lastResult); err != nil {
 		log.Printf("publish error: %v", err)
 	}
 
 	g.lastResult = ""
 }
 
-func (g *Game) publishMessage(scenario models.Scenario) error {
-	log.Printf("publishing scenario: %s...", scenario)
+func (g *Game) applyScenario(s models.Scenario) error {
+	log.Printf("publishing scenario: %s...", s)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
-	defer cancel()
+	switch s {
+	case models.ScenarioScaleUpAP:
+		return g.updateDB(1, models.RegionAP)
+	case models.ScenarioScaleDownAP:
+		return g.updateDB(-1, models.RegionAP)
 
-	if err := g.publishers.Publish(ctx, scenario); err != nil {
-		return fmt.Errorf("publishing scenario: %w", err)
+	case models.ScenarioScaleUpEU:
+		return g.updateDB(1, models.RegionEU)
+	case models.ScenarioScaleDownEU:
+		return g.updateDB(-1, models.RegionEU)
+
+	case models.ScenarioScaleUpUS:
+		return g.updateDB(1, models.RegionUS)
+	case models.ScenarioScaleDownUS:
+		return g.updateDB(-1, models.RegionUS)
+
+	case models.ScenarioNewProduct:
+		return g.updateDB(5, models.RegionAP, models.RegionEU, models.RegionUS)
+	case models.ScenarioFlashSale:
+		return g.updateDB(10, models.RegionAP, models.RegionEU, models.RegionUS)
+	case models.ScenarioScandal:
+		return g.updateDB(5, models.RegionAP, models.RegionEU, models.RegionUS)
+
+	default:
+		return fmt.Errorf("unsupported scenario: %s", s)
+	}
+}
+
+func (g *Game) updateDB(delta int, regions ...string) error {
+	const stmt = `UPDATE workload
+								SET workers = GREATEST(workers + $1, 0)
+								WHERE region = ANY($2)`
+
+	if _, err := g.db.Exec(stmt, delta, regions); err != nil {
+		return fmt.Errorf("making request: %w", err)
 	}
 
-	log.Printf("published scenario: %s", scenario)
 	return nil
 }
 

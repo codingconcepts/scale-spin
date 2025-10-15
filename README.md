@@ -3,13 +3,13 @@ Roulette but for database scaling.
 
 Scales a potentially global workload up and down and the database must keep up to provide the best possible Application Performance Index (Apdex) score which will be calculated based on the following latency map:
 
-| Latency  | Apdex Score  |
-| -------  | -----------  |
-| <= 20ms  | Excellent    |
-| <= 50ms  | Good         |
-| <= 75ms  | Fair         |
-| <= 100ms | Poor         |
-| >  100ms | Unacceptable |
+| Latency  | Apdex Score | Meaning      |
+| -------  | ----------- | ------------ |
+| <= 20ms  | 0.94 - 1.0  | Excellent    |
+| <= 50ms  | 0.85 - 0.93 | Good         |
+| <= 75ms  | 0.70 - 0.84 | Fair         |
+| <= 100ms | 0.69 - 0.50 | Poor         |
+| >  100ms | 0.00 - 0.49 | Unacceptable |
 
 Once the wheel has landed on a scenario, the database has 10 minutes to scale for that workload. Failure to do so, will result in a low Apdex score.
 
@@ -45,10 +45,10 @@ docker buildx build \
 --platform linux/amd64 \
 --build-context pkg=apps/pkg \
 -f apps/workload/Dockerfile \
--t codingconcepts/workload:v0.3.0 \
+-t codingconcepts/workload:v0.17.2 \
 .
 
-docker push codingconcepts/workload:v0.3.0
+docker push codingconcepts/workload:v0.17.2
 ```
 
 Infra
@@ -57,52 +57,126 @@ Infra
 (cd infra && terraform apply --auto-approve)
 ```
 
-### Demo
-
-Connect to CockroachDB
+Export environment variables
 
 ```sh
-cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url)
+export AP_SERVICE_URL=$(cd infra && terraform output --json service_urls | jq -r '.["asia-southeast1"]')
+export EU_SERVICE_URL=$(cd infra && terraform output --json service_urls | jq -r '.["europe-west2"]')
+export US_SERVICE_URL=$(cd infra && terraform output --json service_urls | jq -r '.["us-east1"]')
 ```
+
+### Demo
 
 Create objects and insert data
 
-```sql
-CREATE TABLE account (
+```sh
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "CREATE TABLE workload (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  region STRING NOT NULL,
+  workers INT NOT NULL DEFAULT 0
+)"
+
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "INSERT INTO workload (region, workers) VALUES
+             ('gcp-asia-southeast1', 0),
+             ('gcp-europe-west2', 0),
+             ('gcp-us-east1', 0)"
+
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "CREATE TABLE account (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   balance DECIMAL NOT NULL
-);
+)"
 
-INSERT INTO account (balance)
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "INSERT INTO account (balance)
   SELECT ROUND(random() * 10000, 2)
-  FROM generate_series(1, 10000);
+  FROM generate_series(1, 1000)"
+```
+
+Monitor service logs
+
+```sh
+
+gcloud beta run services logs read crdb-scale-spin --region asia-southeast1 --limit 10
+gcloud beta run services logs read crdb-scale-spin --region europe-west2 --limit 10
+gcloud beta run services logs read crdb-scale-spin --region us-east1 --limit 10
 ```
 
 Spin the wheel!
 
 ```sh
-AWS_PROFILE="rob-sso-crlshared" \
-US_SQS_QUEUE_URL=$(cd infra && terraform output --json sqs_queue_urls | jq -r '.us_east_1') \
-EU_SQS_QUEUE_URL=$(cd infra && terraform output --json sqs_queue_urls | jq -r '.eu_west_2') \
-AP_SQS_QUEUE_URL=$(cd infra && terraform output --json sqs_queue_urls | jq -r '.ap_southeast_1') \
-go run apps/wheel/main.go
+go run apps/wheel/main.go \
+--url $(cd infra && terraform output --raw cockroachdb_global_url)
+```
+
+Update infrastructure to make CockroachDB multi-region
+
+```sh
+(cd infra && terraform apply --auto-approve)
+```
+
+Alter table locality
+
+```sh
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "ALTER DATABASE bank SET PRIMARY REGION 'gcp-europe-west2'"
+
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "ALTER DATABASE bank ADD REGION 'gcp-us-east1'"
+
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "ALTER DATABASE bank ADD REGION 'gcp-asia-southeast1'"
+
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "ALTER TABLE account SET LOCALITY REGIONAL BY ROW"
+
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "UPDATE account
+  SET crdb_region = CASE 
+      WHEN random() < 0.33 THEN 'gcp-asia-southeast1'
+      WHEN random() < 0.66 THEN 'gcp-europe-west2'
+      ELSE 'gcp-us-east1'
+  END"
+```
+
+Build MR application
+
+```sh
+docker buildx build \
+--platform linux/amd64 \
+--build-context pkg=apps/pkg \
+-f apps/workload/Dockerfile \
+-t codingconcepts/workload:v0.17.2 \
+.
+
+docker push codingconcepts/workload:v0.17.2
+```
+
+Update infrastructure to publish multi-region application.
+
+```sh
+(cd infra && terraform apply --auto-approve)
+```
+
+Fetch Apdex scores
+
+```sh
+curl -s "${AP_SERVICE_URL}/apdex"
+curl -s "${EU_SERVICE_URL}/apdex"
+curl -s "${US_SERVICE_URL}/apdex"
 ```
 
 ### Summary
 
-
-
-### Teardown
-
-Purge queues
+Run local worker  
 
 ```sh
-aws sqs purge-queue --queue-url $(cd infra && terraform output --json sqs_queue_urls | jq -r '.us_east_1') --region us-east-1
 
-aws sqs purge-queue --queue-url $(cd infra && terraform output --json sqs_queue_urls | jq -r '.eu_west_2') --region eu-west-2
-
-aws sqs purge-queue --queue-url $(cd infra && terraform output --json sqs_queue_urls | jq -r '.ap_southeast_1') --region ap-southeast-1
 ```
+
+### Teardown
 
 Infra
 
@@ -112,15 +186,50 @@ Infra
 
 ### Scratchpad
 
+Export environment variables
+
+```sh
+export DATABASE_URL=$(cd infra && terraform output --raw cockroachdb_global_url)
+export DATABASE_DRIVER="pgx"
+export REGION="gcp-europe-west2"
+```
+
+Test deployed service
+
+```sh
+curl -s "${EU_APP_URL}/healthz"
+curl -s "${EU_APP_URL}/messages" --json '{"scenario": "test"}'
+curl -s "${EU_APP_URL}/messages" --json '{"scenario": "scale-up-eu"}'
+```
+
+Test binary locally
+
+```sh
+go run apps/workload/main.go
+
+curl -s http://localhost:8080/healthz
+```
+
 Test image locally
 
 ```sh
 docker run --rm -it codingconcepts/workload
 ```
 
-Test SQS
+View busiest queries of the last 10 minutes
 
 ```sh
-curl -s http://crdb-scale-spin-alb-eu-1813114863.eu-west-2.elb.amazonaws.com \
---json '{ "scenario": "test" }'
+cockroach sql --url $(cd infra && terraform output --raw cockroachdb_global_url) \
+--execute "SELECT 
+    metadata->>'query' AS query,
+    metadata->>'db' AS database,
+    (statistics->'runLat') AS mean_latency_seconds
+FROM 
+    crdb_internal.statement_statistics
+WHERE
+     metadata->>'db' = 'defaultdb'
+ORDER BY 
+    (statistics->>'cnt')::INT DESC
+LIMIT 10"
+
 ```

@@ -1,4 +1,6 @@
-# CockroachDB
+###############
+# CockroachDB #
+###############
 
 variable "cockroachdb_cluster_name" {
   description = "Name of the CockroachDB cluster."
@@ -33,24 +35,50 @@ variable "cockroachdb_regions" {
   }))
 }
 
-# SQS
+##########
+# Docker #
+##########
 
-variable "cluster_name_prefix" {
-  description = "The value that will prefix all ECS cluster names."
+variable "local_docker_host" {
+  description = "Path of the local Docker socket"
   type        = string
 }
 
-variable "desired_count" {
-  description = "The number of Fargate services to run in each region."
-  type        = number
-}
-
-variable "image" {
-  description = "Docker image name."
+variable "docker_build_context" {
+  description = "Directory for running Docker commands"
   type        = string
 }
 
-variable "database_driver" {
-  description = "Name of the database driver to use."
+variable "image_name" {
+  description = "Name of the image to push (and pull)"
+  type        = string
+}
+
+#######
+# GCP #
+#######
+
+variable "gcp_project_id" {
+  description = "GCP Project ID"
+  type        = string
+}
+
+variable "gcp_environment_variables" {
+  description = "Environment variables for each region"
+  type        = map(map(string))
+}
+
+variable "gcp_repo_name" {
+  description = "Name of the GCP repo to store images"
+  type        = string
+}
+
+variable "gcp_regions" {
+  description = "List of regions to deploy to"
+  type        = list(string)
+}
+
+variable "gcp_service_name" {
+  description = "Name of the GCP service to run"
   type        = string
 }

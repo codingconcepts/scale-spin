@@ -9,7 +9,6 @@ import (
 
 	"github.com/codingconcepts/errhandler"
 	"github.com/codingconcepts/scale-spin/apps/pkg/apdex"
-	"github.com/codingconcepts/scale-spin/apps/pkg/models"
 	"github.com/codingconcepts/scale-spin/apps/pkg/repo"
 )
 
@@ -17,8 +16,7 @@ type Runner struct {
 	repo   repo.Repo
 	region string
 
-	messages     chan models.Message
-	requestsMade chan time.Duration
+	taken chan time.Duration
 
 	lastScoreMu sync.RWMutex
 	lastScore   float64
@@ -27,12 +25,11 @@ type Runner struct {
 	workers   []*Worker
 }
 
-func New(repo repo.Repo, region string, messages chan models.Message) *Runner {
+func New(repo repo.Repo, region string) *Runner {
 	return &Runner{
-		repo:         repo,
-		region:       region,
-		messages:     messages,
-		requestsMade: make(chan time.Duration, 1000),
+		repo:   repo,
+		region: region,
+		taken:  make(chan time.Duration, 1000),
 	}
 }
 
@@ -42,31 +39,13 @@ func (rr *Runner) Run() {
 	latencies := newThreadUnsafeRing[time.Duration](1000)
 	requestsMade := 0
 
+	go rr.pollForWorkers()
+
 	for {
 		select {
-		case taken := <-rr.requestsMade:
+		case taken := <-rr.taken:
 			requestsMade++
 			latencies.add(taken)
-
-		case msg := <-rr.messages:
-			switch msg.Scenario {
-			case models.ScenarioScaleUpEU:
-				if rr.region != "aws-eu-west-2" {
-					continue
-				}
-				rr.addWorker()
-
-			case models.ScenarioScaleDownEU:
-				if rr.region != "aws-eu-west-2" {
-					continue
-				}
-				rr.removeWorker()
-
-			case models.ScenarioFlashSale:
-
-			case models.ScenarioTest:
-				log.Printf("test message received")
-			}
 
 		case <-logTicks:
 			latencySlice := latencies.slice()
@@ -78,22 +57,50 @@ func (rr *Runner) Run() {
 	}
 }
 
-func (rr *Runner) addWorker() {
+func (rr *Runner) pollForWorkers() {
+	for range time.Tick(time.Second * 5) {
+		workers, err := rr.repo.FetchWorkers(context.Background(), rr.region)
+		if err != nil {
+			log.Printf("error fetching worker count: %v", err)
+			continue
+		}
+
+		rr.setWorkers(workers)
+	}
+}
+
+func (rr *Runner) setWorkers(count int) {
 	rr.workersMu.Lock()
 	defer rr.workersMu.Unlock()
 
+	for len(rr.workers) != count {
+		time.Sleep(time.Millisecond * 100)
+		log.Printf("workers: %d / desired: %d", len(rr.workers), count)
+
+		if len(rr.workers) < count {
+			rr.addWorker()
+		} else {
+			rr.removeWorker()
+		}
+	}
+}
+
+// addWorker starts a new worker thread.
+//
+// IMPORTANT: Caller must hold an exclusive lock to rr.workersMu before invoking.
+func (rr *Runner) addWorker() {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	w := NewWorker(ctx, cancel, rr.repo)
+	w := NewWorker(ctx, cancel, rr.repo, rr.taken)
 	rr.workers = append(rr.workers, w)
 
 	go w.run()
 }
 
+// removeWorker stops a worker thread.
+//
+// IMPORTANT: Caller must hold an exclusive lock to rr.workersMu before invoking.
 func (rr *Runner) removeWorker() {
-	rr.workersMu.Lock()
-	defer rr.workersMu.Unlock()
-
 	if len(rr.workers) == 0 {
 		log.Printf("no workers to remove")
 		return
@@ -107,34 +114,17 @@ func (rr *Runner) removeWorker() {
 	rr.workers = rr.workers[:lastIdx]
 }
 
-type scenarioRequest struct {
-	Scenario string `json:"scenario"`
-}
-
 func (r *Runner) Serve() error {
 	mux := http.NewServeMux()
+	mux.Handle("GET /healthz", errhandler.Wrap(r.handleHealthCheck))
 	mux.Handle("GET /apdex", errhandler.Wrap(r.getApdex))
 
-	// Tests:
-	//
-	// curl -s http://localhost:3000/messages --json '{"scenario": "scale-up-eu"}'
-	mux.Handle("POST /messages", errhandler.Wrap(r.handleScenarioRequest))
-
-	server := &http.Server{Addr: "localhost:3000", Handler: mux}
+	server := &http.Server{Addr: "0.0.0.0:8080", Handler: mux}
 	return server.ListenAndServe()
 }
 
-func (rr *Runner) handleScenarioRequest(w http.ResponseWriter, r *http.Request) error {
-	var req scenarioRequest
-	if err := errhandler.ParseJSON(r, &req); err != nil {
-		return errhandler.Error(http.StatusUnprocessableEntity, err)
-	}
-
-	rr.messages <- models.Message{
-		Scenario: models.Scenario(req.Scenario),
-		Delete:   models.NoopDelete,
-	}
-	return nil
+func (rr *Runner) handleHealthCheck(w http.ResponseWriter, r *http.Request) error {
+	return errhandler.SendString(w, "OK")
 }
 
 type getApdexResponse struct {
